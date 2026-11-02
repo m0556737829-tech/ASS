@@ -5,25 +5,17 @@ import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
-import android.database.Cursor
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.Transformer
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.util.ArrayDeque
 
 class MainActivity : Activity() {
@@ -31,9 +23,10 @@ class MainActivity : Activity() {
     private lateinit var log: TextView
     private var treeUri: Uri? = null
     private val videos = ArrayDeque<Uri>()
-    private var transformer: Transformer? = null
     private var converted = 0
     private var failed = 0
+    private var total = 0
+    private var busy = false
     private val pickFolder = 41
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,7 +47,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val subtitle = TextView(this).apply {
-            text = "המרת סרטונים ל-MP4 תואם — ישירות במכשיר"
+            text = "מנוע FFmpeg להמרת מגוון רחב של פורמטים ל-MP4"
             textSize = 15f
             gravity = Gravity.CENTER
             setPadding(0, 10, 0, 24)
@@ -68,11 +61,11 @@ class MainActivity : Activity() {
         }
         val choose = Button(this).apply {
             text = "בחירת תיקייה"
-            setOnClickListener { openFolderPicker() }
+            setOnClickListener { if (!busy) openFolderPicker() }
         }
         val scan = Button(this).apply {
             text = "סריקה והמרת כל הסרטונים"
-            setOnClickListener { scanAndConvert() }
+            setOnClickListener { if (!busy) scanAndConvert() }
         }
         log = TextView(this).apply {
             textSize = 14f
@@ -125,7 +118,7 @@ class MainActivity : Activity() {
                 val parentId = queue.removeFirst()
                 if (!visited.add(parentId)) continue
                 val children = DocumentsContract.buildChildDocumentsUriUsingTree(root, parentId)
-                contentResolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { cursor ->
+                contentResolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_MIME_TYPE), null, null, null)?.use { cursor ->
                     val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                     val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
                     while (cursor.moveToNext()) {
@@ -136,11 +129,17 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            log.text = "נמצאו ${videos.size} סרטונים. מתחיל המרה..."
             converted = 0
             failed = 0
-            if (videos.isEmpty()) status.text = "לא נמצאו סרטונים בתיקייה"
-            else convertNext()
+            total = videos.size
+            if (videos.isEmpty()) {
+                status.text = "לא נמצאו סרטונים בתיקייה"
+                log.text = ""
+            } else {
+                busy = true
+                log.text = "נמצאו $total סרטונים. מתחיל עיבוד עם FFmpeg..."
+                convertNext()
+            }
         } catch (e: Exception) {
             status.text = "לא הצלחתי לסרוק את התיקייה"
             log.text = e.localizedMessage ?: e.javaClass.simpleName
@@ -149,49 +148,65 @@ class MainActivity : Activity() {
 
     private fun convertNext() {
         if (videos.isEmpty()) {
-            transformer = null
+            busy = false
             status.text = "הסתיים: $converted הומרו, $failed נכשלו"
             log.append("\n\nההמרה הסתיימה. הקבצים נמצאים ב-Movies/Converted.")
             return
         }
+
         val uri = videos.removeFirst()
-        val name = queryName(uri) ?: "video_${System.currentTimeMillis()}"
-        status.text = "ממיר: $name\nנותרו ${videos.size}"
-        val output = File(cacheDir, "converted_${System.currentTimeMillis()}.mp4")
-        val listener = object : Transformer.Listener {
-            override fun onCompleted(composition: androidx.media3.transformer.Composition, exportResult: ExportResult) {
-                try {
-                    saveToMovies(output, safeName(name))
-                    converted++
-                    log.append("\n✓ $name")
-                } catch (e: Exception) {
-                    failed++
-                    log.append("\n✗ שמירה נכשלה: $name")
+        val index = converted + failed + 1
+        val name = queryName(uri) ?: "video_$index"
+        status.text = "ממיר $index מתוך $total: $name"
+        Thread {
+            val input = File(cacheDir, "ffmpeg_input_$index.tmp")
+            val output = File(cacheDir, "ffmpeg_output_$index.mp4")
+            try {
+                contentResolver.openInputStream(uri)?.use { source ->
+                    input.outputStream().use { target -> source.copyTo(target) }
+                } ?: throw IllegalStateException("לא ניתן לקרוא את הסרטון")
+                output.delete()
+
+                val command = "-y -i ${quote(input.absolutePath)} -map 0:v:0 -map 0:a? -sn -dn " +
+                    "-c:v libopenh264 -b:v 2500k -maxrate 3000k -bufsize 5000k -pix_fmt yuv420p " +
+                    "-c:a aac -b:a 128k -movflags +faststart ${quote(output.absolutePath)}"
+
+                FFmpegKit.executeAsync(command) { session ->
+                    runOnUiThread {
+                        try {
+                            if (ReturnCode.isSuccess(session.returnCode) && output.exists() && output.length() > 0) {
+                                saveToMovies(output, safeName(name))
+                                converted++
+                                log.append("\n✓ $name")
+                            } else {
+                                failed++
+                                val detail = session.failStackTrace ?: session.allLogsAsString
+                                log.append("\n✗ נכשל: $name")
+                                if (!detail.isNullOrBlank()) log.append("\n" + detail.takeLast(450))
+                            }
+                        } catch (e: Exception) {
+                            failed++
+                            log.append("\n✗ שמירה נכשלה: $name — ${e.localizedMessage}")
+                        } finally {
+                            input.delete()
+                            output.delete()
+                            convertNext()
+                        }
+                    }
                 }
+            } catch (e: Exception) {
+                input.delete()
                 output.delete()
-                convertNext()
+                runOnUiThread {
+                    failed++
+                    log.append("\n✗ שגיאה בקובץ $name: ${e.localizedMessage}")
+                    convertNext()
+                }
             }
-            override fun onError(composition: androidx.media3.transformer.Composition, exportResult: ExportResult, exportException: ExportException) {
-                failed++
-                log.append("\n✗ לא ניתן להמיר: $name (${exportException.errorCodeName})")
-                output.delete()
-                convertNext()
-            }
-        }
-        try {
-            transformer = Transformer.Builder(this)
-                .setVideoMimeType(MimeTypes.VIDEO_H264)
-                .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                .addListener(listener)
-                .build()
-            transformer!!.start(EditedMediaItem.Builder(MediaItem.fromUri(uri)).build(), output.absolutePath)
-        } catch (e: Exception) {
-            failed++
-            log.append("\n✗ שגיאה: $name — ${e.localizedMessage}")
-            output.delete()
-            convertNext()
-        }
+        }.start()
     }
+
+    private fun quote(path: String): String = "'" + path.replace("'", "'\\''") + "'"
 
     private fun queryName(uri: Uri): String? = contentResolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
         if (c.moveToFirst()) c.getString(0) else null
@@ -208,10 +223,10 @@ class MainActivity : Activity() {
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
             if (android.os.Build.VERSION.SDK_INT >= 29) put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Converted")
         }
-        val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        val target = contentResolver.insert(collection, values) ?: throw IllegalStateException("לא ניתן ליצור קובץ יעד")
+        val target = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("לא ניתן ליצור קובץ יעד")
         try {
-            contentResolver.openOutputStream(target)?.use { out -> FileInputStream(source).use { input -> input.copyTo(out) } }
+            contentResolver.openOutputStream(target)?.use { out -> source.inputStream().use { input -> input.copyTo(out) } }
                 ?: throw IllegalStateException("לא ניתן לכתוב קובץ")
         } catch (e: Exception) {
             contentResolver.delete(target, null, null)
